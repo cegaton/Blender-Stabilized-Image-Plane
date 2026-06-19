@@ -5,36 +5,74 @@ Stabilize-by-plane script for Blender
 What this does
 --------------
 You've already tracked a few markers on an image sequence in the Movie Clip
-Editor (presumably assigned to the Stabilization panel under the Tracking ->
-Stabilization tab). This script:
+Editor (assigned to the Stabilization panel under Tracking -> Stabilization).
+This script:
 
   1. Creates a plane in 3D space (in the XY ground plane, facing +Z).
   2. Textures it with the same image sequence (as an unlit "screen" via an
      Emission shader, so it always shows the raw footage colors).
-  3. For every frame, fits the best rotation+translation (no scaling) that
-     maps your trackers' anchor-frame positions onto their current-frame
-     positions, then keyframes the PLANE with the INVERSE of that transform
-     (X/Y location + Z rotation only).
+  3. For every frame, reconstructs Blender's own 2D-stabilization algorithm
+     from the raw marker data (translation, then rotation/scale around the
+     translation pivot -- see below), then keyframes the PLANE with the
+     INVERSE of that (X/Y location + Z rotation + uniform XY scale).
+
+Matching Blender's actual algorithm
+------------------------------------
+This reconstruction is checked directly against Blender's own source
+(source/blender/blenkernel/intern/tracking_stabilize.cc), not just the
+manual. The real algorithm:
+  1. Translation = the WEIGHTED AVERAGE raw position of the Translation
+     tracks (each track's `weight_stab` controls its influence; tracks with
+     weight below ~0.005 or a muted marker are excluded for that frame,
+     matching `is_effectively_disabled()`). This weighted average position
+     IS the pivot point used below.
+  2. Each Rotation/Scale track's contribution is measured as a vector from
+     that pivot to the track (with the image's aspect ratio applied to the
+     x-axis first, matching `rotation_contribution()`). The ANGLE of each
+     track is averaged across tracks as a plain WEIGHTED ARITHMETIC MEAN
+     (not a vector/circular mean). The SCALE of each track (its distance
+     ratio from the pivot, current vs. anchor, with a small additive bias
+     to keep points very close to the pivot from blowing up) is averaged as
+     a weighted GEOMETRIC MEAN (i.e. the arithmetic mean of its logarithm).
+     Both averages use a "quality" factor that further downweights points
+     close to the pivot, on top of the track's own weight_stab.
+This script implements that math directly, in the same aspect-corrected
+unit space Blender uses, INCLUDING the per-track continuity-baseline system
+that lets tracks with different start/end frames (e.g. a pan/tilt shot
+where the original feature leaves frame and a new one has to take over)
+contribute without a jump at the handoff point -- each track's baseline is
+calibrated against whatever the already-established tracks were already
+reporting at that track's own first usable frame, exactly mirroring
+`establish_track_initialization_order` / `init_track_for_stabilization` in
+the source.
+
+It also honors the panel's `use_stabilize_rotation` / `use_stabilize_scale`
+checkboxes, and the `target_position/rotation/scale` and
+`influence_location/rotation/scale` settings.
 
 Why the inverse? Because the shake is baked into the image content itself.
 To make a tracked feature appear stationary to a fixed top-down camera, the
-plane carrying that frame's image has to move opposite to the apparent
-on-image drift -- exactly the same principle as 2D stabilization, just
-applied to an object transform instead of the pixels.
+plane carrying that frame's image has to move/rotate/scale opposite to the
+apparent on-image drift -- the same principle as 2D stabilization, just
+applied to an object transform instead of pixels.
 
-Note: Blender does not expose the Stabilization panel's internally computed
-per-frame numbers via the Python API, so this script independently
-recomputes an equivalent correction from the raw marker positions. It will
-auto-pick up whichever tracks you've already added to the Translation /
-Rotation-Scale lists in that panel (ignoring any scale settings there, since
-you only want translate XY + rotate Z).
+Caveats (things this script does NOT attempt to replicate exactly):
+  - `use_autoscale` (auto-zoom to cover empty corners introduced by
+    stabilization) is a different, separate mechanism in Blender tied to
+    corner-coverage of the rendered frame -- it isn't applicable to a 3D
+    plane the same way, so it's not implemented here.
+  - `scale_max` (a clamp tied to use_autoscale) is likewise not applied.
+  - `target_position` / `target_rotation` / `target_scale` (explicit known
+    camera-move overrides) ARE applied, but if they're keyframed/animated,
+    this script samples whatever their value is once it steps the scene to
+    each frame (which is the same per-frame evaluation Blender itself uses).
 
 How to use
 ----------
 1. Open this in Blender's Text Editor (or run via `blender --python ...`).
 2. Adjust the CONFIG block below if needed (it will try sane defaults
    automatically: first movie clip found, tracks from its Stabilization
-   panel, anchor frame from that panel, full clip frame range).
+   panel, anchor frame from that panel, full marker-derived frame range).
 3. Run the script (Alt+P in the Text Editor, or the Run Script button).
 4. A plane named "StabilizedFootagePlane" (and optionally a check camera)
    will appear, fully keyframed.
@@ -55,8 +93,12 @@ TRACK_NAMES = []            # leave empty to auto-read from the clip's
 ANCHOR_FRAME = None         # leave None to use the Stabilization panel's
                              # anchor frame (or the clip's start frame if
                              # 2D Stabilization isn't enabled)
-FRAME_START = None          # leave None to use the clip's frame range
+FRAME_START = None          # leave None to use the marker-derived range
 FRAME_END = None
+ENABLE_ROTATION = None      # None = auto from stab.use_stabilize_rotation;
+                             # True/False to force on/off
+ENABLE_SCALE = None         # None = auto from stab.use_stabilize_scale;
+                             # True/False to force on/off
 PLANE_WIDTH = 10.0          # world-space width of the plane, in Blender units
                              # (height is derived automatically to match the
                              # image's aspect ratio)
@@ -114,15 +156,36 @@ def main():
     if not loc_tracks:
         raise RuntimeError("No translation/location tracks available to use.")
 
-    rotation_enabled = len(rot_tracks) >= 2
+    def panel_flag(name, default=True):
+        try:
+            return getattr(stab, name)
+        except AttributeError:
+            return default
+
+    if ENABLE_ROTATION is not None:
+        rotation_enabled = ENABLE_ROTATION and len(rot_tracks) >= 1
+    else:
+        rotation_enabled = panel_flag("use_stabilize_rotation") and len(rot_tracks) >= 1
+
+    if ENABLE_SCALE is not None:
+        scale_enabled = ENABLE_SCALE and len(rot_tracks) >= 1
+    else:
+        scale_enabled = panel_flag("use_stabilize_scale") and len(rot_tracks) >= 1
+
     if rot_tracks and not rotation_enabled:
-        print(f"NOTE: only {len(rot_tracks)} rotation track(s) found -- need "
-              f"at least 2 to determine a rotation angle, so rotation "
-              f"correction is disabled.")
+        print("NOTE: Rotation/Scale tracks exist but 'Stabilize Rotation' is "
+              "off in the Stabilization panel (or ENABLE_ROTATION=False) -- "
+              "rotation correction disabled, Z rotation stays 0.")
+    if rot_tracks and not scale_enabled:
+        print("NOTE: Rotation/Scale tracks exist but 'Stabilize Scale' is "
+              "off in the Stabilization panel (or ENABLE_SCALE=False) -- "
+              "scale correction disabled, plane scale stays 1.0.")
 
     print("Translation tracks:", [t.name for t in loc_tracks])
-    print("Rotation tracks:", [t.name for t in rot_tracks] if rotation_enabled
-          else "(none -- rotation correction disabled, Z rotation stays 0)")
+    print("Rotation/Scale tracks:", [t.name for t in rot_tracks] if rot_tracks
+          else "(none)")
+    print(f"Rotation correction: {'enabled' if rotation_enabled else 'disabled'}  "
+          f"Scale correction: {'enabled' if scale_enabled else 'disabled'}")
 
     all_used_tracks = list(loc_tracks)
     for t in rot_tracks:
@@ -189,19 +252,115 @@ def main():
 
     # ---- 4. Geometry helpers --------------------------------------------
     width_px, height_px = clip.size
-    aspect = (height_px / width_px) if width_px else 1.0
+    aspect_hw = (height_px / width_px) if width_px else 1.0   # for the plane mesh
+    aspect_wh = (width_px / height_px) if height_px else 1.0  # matches Blender's
+                                                                # internal "aspect"
+                                                                # (x-axis correction)
     plane_width = PLANE_WIDTH
-    plane_height = plane_width * aspect
+    plane_height = plane_width * aspect_hw
 
-    def marker_local(track, frame):
-        """Returns the tracker's position in plane-local 2D coordinates,
-        centered at the plane's origin, for a given frame (or None if no
-        marker data exists there)."""
+    # Matches Blender's own constants in tracking_stabilize.cc
+    SCALE_ERROR_LIMIT_BIAS = 0.01   # damping bias for points close to the pivot
+    EPSILON_WEIGHT = 0.005          # below this, a track counts as "disabled"
+                                     # for this frame (matches is_effectively_disabled)
+
+    def raw_marker(track, frame):
+        """Raw (co, weight) for a track at a frame, or None if unusable --
+        matches Blender's get_tracking_data_point()/is_effectively_disabled():
+        excludes muted markers and near-zero per-track weight_stab."""
         marker = track.markers.find_frame(frame, exact=False)
-        if marker is None:
+        if marker is None or getattr(marker, "mute", False):
             return None
-        co = marker.co  # normalized 0..1, (0,0) = bottom-left of the frame
-        return Vector(((co[0] - 0.5) * plane_width, (co[1] - 0.5) * plane_height))
+        w = max(track_weight(track), 0.0)
+        if w < EPSILON_WEIGHT:
+            return None
+        return Vector((marker.co[0], marker.co[1])), w
+
+    def track_weight(track):
+        """Per-track influence on the stabilizer (Stabilization panel's
+        'Stab Weight', evaluated at the scene's CURRENT frame, since it can
+        be animated). Falls back to 1.0 (equal weighting) if unavailable."""
+        return getattr(track, "weight_stab", 1.0)
+
+    def track_reference_frame(track, anchor_f):
+        """The frame with usable data closest to anchor_f for this track --
+        its own local starting point for the baseline calibration below.
+        Returns None if the track has no usable data anywhere."""
+        usable = [m.frame for m in track.markers
+                  if raw_marker(track, m.frame) is not None]
+        if not usable:
+            return None
+        return min(usable, key=lambda f: abs(f - anchor_f))
+
+    def build_continuity_baselines(track_list, anchor_f, value_fn, weight_fn):
+        """Generic incremental baseline builder, mirroring Blender's gap-
+        handling scheme (establish_track_initialization_order +
+        init_track_for_stabilization in tracking_stabilize.cc). This is
+        what lets tracks with DIFFERENT start/end frames -- e.g. handed off
+        partway through a pan once the original feature leaves frame --
+        contribute continuously instead of jumping when one track ends and
+        another begins.
+
+        For each track, finds its own reference frame (closest usable frame
+        to the global anchor), then initializes tracks in order of
+        increasing distance from the anchor, batching tracks that share the
+        same reference frame. Each track's baseline is set so its
+        contribution exactly matches whatever the ALREADY-initialized
+        tracks were already reporting at this track's reference frame --
+        for the very first batch (sitting at the true anchor frame, where
+        no track has been initialized yet), the baseline is simply zero.
+
+        value_fn(track, frame) -> raw value (Vector or float) or None
+        weight_fn(track, frame) -> weight (only called when value isn't None)
+        Returns (baseline_dict, ref_frame_dict); tracks with no usable data
+        anywhere are omitted from both.
+        """
+        ref_frame = {}
+        for t in track_list:
+            rf = track_reference_frame(t, anchor_f)
+            if rf is not None:
+                ref_frame[t] = rf
+        order = sorted(ref_frame.items(), key=lambda kv: abs(kv[1] - anchor_f))
+
+        baseline = {}
+        initialized = []
+        i = 0
+        while i < len(order):
+            rf = order[i][1]
+            batch = []
+            j = i
+            while j < len(order) and order[j][1] == rf:
+                batch.append(order[j][0])
+                j += 1
+
+            acc, wsum = None, 0.0
+            for t in initialized:
+                v = value_fn(t, rf)
+                if v is None:
+                    continue
+                w = weight_fn(t, rf)
+                contribution = baseline[t] + v
+                acc = contribution * w if acc is None else acc + contribution * w
+                wsum += w
+            avg_contribution = (acc / wsum) if wsum > EPSILON_WEIGHT else None
+
+            for t in batch:
+                v = value_fn(t, rf)
+                base_avg = avg_contribution if avg_contribution is not None else v * 0.0
+                baseline[t] = base_avg - v
+                initialized.append(t)
+
+            i = j
+        return baseline, ref_frame
+
+    def aspect_vec(co_raw, pivot_raw):
+        """Vector from pivot to a raw marker position, with Blender's x-axis
+        aspect correction applied (matches rotation_contribution() in
+        tracking_stabilize.cc: `pos[0] *= aspect` where aspect = width/height).
+        This is the unit space in which angle, length, the scale bias, and
+        the proximity 'quality' factor are all computed."""
+        d = co_raw - pivot_raw
+        return Vector((d.x * aspect_wh, d.y))
 
     # ---- 5. Build the plane mesh (with UVs matching the mapping above) -
     mesh = bpy.data.meshes.new(PLANE_NAME)
@@ -280,21 +439,138 @@ def main():
           "but the texture is still pink in the viewport, try toggling "
           "Material Preview/Rendered shading.")
 
-    # ---- 7. Compute the anchor-frame reference configuration -----------
-    def anchor_set(track_list, label):
-        pts = []
-        for t in track_list:
-            p = marker_local(t, anchor_frame)
-            if p is None:
-                raise RuntimeError(f"Track '{t.name}' ({label}) has no marker "
-                                    f"data at anchor frame {anchor_frame}.")
-            pts.append(p)
-        centroid = sum(pts, Vector((0.0, 0.0))) / len(pts)
-        return centroid, [p - centroid for p in pts]
+    # ---- 7. Build continuity baselines (handles tracks with different ----
+    # ----    start/end frames -- e.g. a pan/tilt shot where the original
+    # ----    tracked feature leaves frame and a new one must take over) ---
+    def loc_value(t, f):
+        r = raw_marker(t, f)
+        return r[0] if r else None
 
-    ca, centered0 = anchor_set(loc_tracks, "translation")
-    if rotation_enabled:
-        ca_rot, centered0_rot = anchor_set(rot_tracks, "rotation")
+    def loc_weight(t, f):
+        r = raw_marker(t, f)
+        return r[1] if r else 0.0
+
+    loc_baseline, loc_ref_frame = build_continuity_baselines(loc_tracks, anchor_frame, loc_value, loc_weight)
+
+    def report_continuity(label, ref_frame_dict):
+        gapped = {t.name: rf for t, rf in ref_frame_dict.items() if rf != anchor_frame}
+        if gapped:
+            print(f"  {label}: {len(gapped)} track(s) don't cover the anchor "
+                  f"frame ({anchor_frame}) and are using gap-continuity "
+                  f"correction, calibrated at their own nearest frame: "
+                  f"{gapped}")
+        else:
+            print(f"  {label}: all tracks cover the anchor frame -- no gap "
+                  f"correction needed.")
+
+    print("---- Gap-continuity check (handles tracks with different "
+          "start/end frames, e.g. handed off mid-pan) ----")
+    report_continuity("Translation", loc_ref_frame)
+
+    def loc_pivot_and_translation(frame):
+        """Returns (pivot, translation_total) at a frame, or (None, None) if
+        no translation track has usable data there. `pivot` is the plain
+        weighted-average raw position (used as the rotation/scale pivot,
+        matching Blender's r_pivot). `translation_total` is the baseline-
+        corrected weighted-average CONTRIBUTION -- the total accumulated
+        drift since the anchor frame, continuity-corrected across gaps
+        (exactly 0 at the anchor frame by construction)."""
+        acc_pos, wsum_pos = Vector((0.0, 0.0)), 0.0
+        acc_contrib, wsum_contrib = Vector((0.0, 0.0)), 0.0
+        for t in loc_tracks:
+            r = raw_marker(t, frame)
+            if r is None:
+                continue
+            co, w = r
+            acc_pos += co * w
+            wsum_pos += w
+            if t in loc_baseline:
+                acc_contrib += (loc_baseline[t] + co) * w
+                wsum_contrib += w
+        if wsum_pos < EPSILON_WEIGHT:
+            return None, None
+        pivot = acc_pos / wsum_pos
+        translation_total = (acc_contrib / wsum_contrib) if wsum_contrib >= EPSILON_WEIGHT else Vector((0.0, 0.0))
+        return pivot, translation_total
+
+    _pivot_cache = {}
+    def pivot_at(frame):
+        if frame not in _pivot_cache:
+            p, _ = loc_pivot_and_translation(frame)
+            _pivot_cache[frame] = p
+        return _pivot_cache[frame]
+
+    def rot_quality_weight(t, f):
+        piv = pivot_at(f)
+        if piv is None:
+            return 0.0
+        r = raw_marker(t, f)
+        if r is None:
+            return 0.0
+        co, w = r
+        length = aspect_vec(co, piv).length
+        quality = 1.0 - math.exp(-(length * length))
+        return w * quality
+
+    def rot_angle_value(t, f):
+        piv = pivot_at(f)
+        if piv is None:
+            return None
+        r = raw_marker(t, f)
+        if r is None:
+            return None
+        co, _w = r
+        v = aspect_vec(co, piv)
+        if v.length < 1e-9:
+            return None
+        return math.atan2(v.y, v.x)
+
+    def rot_logscale_value(t, f):
+        piv = pivot_at(f)
+        if piv is None:
+            return None
+        r = raw_marker(t, f)
+        if r is None:
+            return None
+        co, _w = r
+        return math.log(aspect_vec(co, piv).length + SCALE_ERROR_LIMIT_BIAS)
+
+    angle_baseline, scale_baseline = {}, {}
+    if (rotation_enabled or scale_enabled) and rot_tracks:
+        angle_baseline, rot_ref_frame = build_continuity_baselines(
+            rot_tracks, anchor_frame, rot_angle_value, rot_quality_weight)
+        scale_baseline, _ = build_continuity_baselines(
+            rot_tracks, anchor_frame, rot_logscale_value, rot_quality_weight)
+        report_continuity("Rotation/Scale", rot_ref_frame)
+    print("-------------------------------------------------------------")
+
+    def rot_estimate(frame):
+        """Ensemble (theta, scale_det, any_data) at a frame: theta is the
+        weighted ARITHMETIC mean of baseline-corrected per-track angles
+        (radians, 0 at the anchor frame by construction); scale_det is the
+        weighted GEOMETRIC mean (exp of the log-average) of baseline-
+        corrected per-track distance ratios (1.0 at the anchor frame)."""
+        angle_acc, angle_wsum = 0.0, 0.0
+        scale_acc, scale_wsum = 0.0, 0.0
+        any_data = False
+        for t in rot_tracks:
+            w = rot_quality_weight(t, frame)
+            if w <= 0.0:
+                continue
+            if t in angle_baseline:
+                av = rot_angle_value(t, frame)
+                if av is not None:
+                    any_data = True
+                    angle_acc += (angle_baseline[t] + av) * w
+                    angle_wsum += w
+            if t in scale_baseline:
+                sv = rot_logscale_value(t, frame)
+                if sv is not None:
+                    scale_acc += (scale_baseline[t] + sv) * w
+                    scale_wsum += w
+        theta = (angle_acc / angle_wsum) if angle_wsum > 1e-9 else 0.0
+        scale_det = math.exp(scale_acc / scale_wsum) if scale_wsum > 1e-9 else 1.0
+        return theta, scale_det, any_data
 
     # ---- 8. Per-frame fit + keyframe ------------------------------------
     # Set new keyframes to LINEAR interpolation up front (since we key every
@@ -306,68 +582,100 @@ def main():
     original_interp = prefs_edit.keyframe_new_interpolation_type
     prefs_edit.keyframe_new_interpolation_type = 'LINEAR'
 
-    observed_locations = []  # for a post-run "did anything actually move" check
+    original_scene_frame = scene.frame_current
 
+    observed_locations = []  # for a post-run "did anything actually move" check
     missing_rot_frames = 0
 
     for frame in range(int(frame_start), int(frame_end) + 1):
-        Pf = []
-        ok = True
-        for t in loc_tracks:
-            p = marker_local(t, frame)
-            if p is None:
-                ok = False
-                break
-            Pf.append(p)
-        if not ok:
-            continue  # skip frames where a translation tracker has no data
+        scene_frame = frame + scene_frame_offset
+        # Step the actual scene frame so any animated stabilization
+        # properties (weight_stab, target_position/rotation/scale,
+        # influence_*) evaluate to their correct per-frame value, exactly
+        # as Blender's own stabilizer would read them.
+        scene.frame_set(scene_frame)
 
-        cc = sum(Pf, Vector((0.0, 0.0))) / len(Pf)
+        pivot_f, translation_total_f = loc_pivot_and_translation(frame)
+        if pivot_f is None:
+            continue  # skip frames where no translation tracker has usable data
+        pivot_f_plane = Vector(((pivot_f.x - 0.5) * plane_width, (pivot_f.y - 0.5) * plane_height))
+        # translation_total_f is a DELTA (drift since anchor), not an
+        # absolute position -- so no -0.5 centering offset here, just scale.
+        translation_plane = Vector((translation_total_f.x * plane_width,
+                                     translation_total_f.y * plane_height))
 
-        theta = 0.0
-        if rotation_enabled:
-            Pf_rot = []
-            rot_ok = True
-            for t in rot_tracks:
-                p = marker_local(t, frame)
-                if p is None:
-                    rot_ok = False
-                    break
-                Pf_rot.append(p)
-            if rot_ok:
-                cc_rot = sum(Pf_rot, Vector((0.0, 0.0))) / len(Pf_rot)
-                centeredf_rot = [p - cc_rot for p in Pf_rot]
-                num = sum(a.x * c.y - a.y * c.x for a, c in zip(centered0_rot, centeredf_rot))
-                den = sum(a.x * c.x + a.y * c.y for a, c in zip(centered0_rot, centeredf_rot))
-                theta = math.atan2(num, den) * ROTATION_DIRECTION
-            else:
+        theta, scale_det = 0.0, 1.0
+        if (rotation_enabled or scale_enabled) and rot_tracks:
+            theta, scale_det, any_data = rot_estimate(frame)
+            if not any_data:
                 missing_rot_frames += 1
-                # keep theta = 0.0 for this frame; translation still applies
+            if not rotation_enabled:
+                theta = 0.0
+            if not scale_enabled:
+                scale_det = 1.0
 
-        cos_t, sin_t = math.cos(theta), math.sin(theta)
-        # Rotate cc by -theta
-        rcc = Vector((cos_t * cc.x + sin_t * cc.y, -sin_t * cc.x + cos_t * cc.y))
-        t_vec = ca - rcc
-        phi = -theta
+        # ---- Explicit "known shot move" overrides (target_*) -----------
+        # These default to 0/0/1 and are rarely touched, but apply them if
+        # the user has set them (they can also be animated -- already
+        # picked up correctly since we stepped the scene frame above).
+        tgt_pos = Vector((0.0, 0.0))
+        tgt_rot = 0.0
+        tgt_scale = 1.0
+        try:
+            tgt_pos = Vector((stab.target_position[0] * plane_width,
+                               stab.target_position[1] * plane_height))
+            tgt_rot = stab.target_rotation
+            tgt_scale = stab.target_scale if stab.target_scale > 0 else 1.0
+        except AttributeError:
+            pass
+
+        # ---- Influence sliders (blend correction amount toward 0) ------
+        infl_loc = getattr(stab, "influence_location", 1.0)
+        infl_rot = getattr(stab, "influence_rotation", 1.0)
+        infl_scale = getattr(stab, "influence_scale", 1.0)
+
+        theta_eff = (theta + tgt_rot) * infl_rot
+        scale_eff = 1.0 + ((scale_det * tgt_scale) - 1.0) * infl_scale
+        translation_eff = translation_plane * infl_loc
+
+        r_f = -theta_eff
+        s_f = (1.0 / scale_eff) if scale_eff > 1e-9 else 1.0
+
+        cos_r, sin_r = math.cos(r_f), math.sin(r_f)
+        # Rotate + scale pivot_f_plane by (s_f, r_f), recenter it back onto
+        # itself, then subtract the (baseline-corrected, gap-continuous)
+        # translation drift -- this generalizes the simple no-gap formula
+        # "rotate the pivot, recenter, done" to also account for tracks
+        # that started/ended partway through the sequence.
+        rp = Vector((s_f * (cos_r * pivot_f_plane.x - sin_r * pivot_f_plane.y),
+                     s_f * (sin_r * pivot_f_plane.x + cos_r * pivot_f_plane.y)))
+        t_vec = pivot_f_plane - rp - translation_eff - tgt_pos
 
         plane_obj.location.x = t_vec.x
         plane_obj.location.y = t_vec.y
         plane_obj.location.z = 0.0
-        plane_obj.rotation_euler.z = phi
+        plane_obj.rotation_euler.z = r_f
+        plane_obj.scale.x = s_f
+        plane_obj.scale.y = s_f
 
-        observed_locations.append((t_vec.x, t_vec.y, phi))
+        observed_locations.append((t_vec.x, t_vec.y, r_f, s_f))
 
-        scene_frame = frame + scene_frame_offset
         plane_obj.keyframe_insert(data_path="location", index=0, frame=scene_frame)
         plane_obj.keyframe_insert(data_path="location", index=1, frame=scene_frame)
         plane_obj.keyframe_insert(data_path="rotation_euler", index=2, frame=scene_frame)
+        plane_obj.keyframe_insert(data_path="scale", index=0, frame=scene_frame)
+        plane_obj.keyframe_insert(data_path="scale", index=1, frame=scene_frame)
+
+    scene.frame_set(original_scene_frame)
 
     # ---- 8b. Sanity check: did the plane actually move at all? ---------
     if observed_locations:
         xs = [v[0] for v in observed_locations]
         ys = [v[1] for v in observed_locations]
         rs = [v[2] for v in observed_locations]
-        spread = max(max(xs) - min(xs), max(ys) - min(ys), max(rs) - min(rs))
+        ss = [v[3] for v in observed_locations]
+        spread = max(max(xs) - min(xs), max(ys) - min(ys),
+                     max(rs) - min(rs), max(ss) - min(ss))
         if spread < 1e-6:
             print("WARNING: the computed plane transform is IDENTICAL on "
                   "every frame (no motion detected at all). This almost "
@@ -393,11 +701,12 @@ def main():
     print(f"Done. Created '{plane_obj.name}', keyframed scene frames "
           f"{frame_start + scene_frame_offset}-{frame_end + scene_frame_offset} "
           f"(anchor frame {anchor_frame}, clip-relative). "
-          f"Rotation correction: {'enabled' if rotation_enabled else 'disabled (Z rotation stays 0)'}.")
-    if rotation_enabled and missing_rot_frames:
+          f"Rotation: {'enabled' if rotation_enabled else 'disabled (stays 0)'}.  "
+          f"Scale: {'enabled' if scale_enabled else 'disabled (stays 1.0)'}.")
+    if (rotation_enabled or scale_enabled) and missing_rot_frames:
         print(f"NOTE: {missing_rot_frames} frame(s) had translation data but "
-              f"no rotation-track data; rotation was left at 0 for those "
-              f"specific frames only.")
+              f"no rotation/scale-track data; rotation/scale were left at "
+              f"their neutral values (0 / 1.0) for those specific frames only.")
 
 
 main()
