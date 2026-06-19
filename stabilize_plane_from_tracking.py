@@ -82,26 +82,52 @@ def main():
     stab = tracking.stabilization
 
     # ---- 2. Resolve which tracks to use --------------------------------
-    tracks = []
+    # IMPORTANT: keep the Translation list and the Rotation/Scale list
+    # SEPARATE. A previous version of this script merged both into one
+    # pool and always fitted a rotation from whatever points were in that
+    # pool -- so even with zero tracks assigned to Rotation/Scale in the
+    # Stabilization panel, a rotation got computed (and keyframed) anyway,
+    # since any 2+ real-world tracked points will show *some* apparent
+    # rotation even when the user only wanted translation correction.
     if TRACK_NAMES:
-        tracks = [tracking.tracks[name] for name in TRACK_NAMES]
+        loc_tracks = [tracking.tracks[name] for name in TRACK_NAMES]
+        rot_tracks = list(loc_tracks)  # explicit override: treat all as both
     else:
-        seen = set()
+        loc_tracks, rot_tracks = [], []
         try:
-            for coll in (stab.tracks, stab.rotation_tracks):
-                for t in coll:
-                    if t.name not in seen:
-                        tracks.append(t)
-                        seen.add(t.name)
+            loc_tracks = list(stab.tracks)
         except AttributeError:
             pass
-        if not tracks:
-            tracks = list(tracking.tracks)
+        try:
+            rot_tracks = list(stab.rotation_tracks)
+        except AttributeError:
+            pass
+        if not loc_tracks and not rot_tracks:
+            print("WARNING: no Translation or Rotation/Scale tracks found in "
+                  "the Stabilization panel. Falling back to using ALL tracks "
+                  "in the clip for BOTH translation and rotation. If you only "
+                  "want translation, assign tracks to the Stabilization "
+                  "panel's Translation list in the Clip Editor and re-run.")
+            loc_tracks = list(tracking.tracks)
+            rot_tracks = list(tracking.tracks)
 
-    if not tracks:
-        raise RuntimeError("No tracking markers available to use.")
+    if not loc_tracks:
+        raise RuntimeError("No translation/location tracks available to use.")
 
-    print("Stabilizing using tracks:", [t.name for t in tracks])
+    rotation_enabled = len(rot_tracks) >= 2
+    if rot_tracks and not rotation_enabled:
+        print(f"NOTE: only {len(rot_tracks)} rotation track(s) found -- need "
+              f"at least 2 to determine a rotation angle, so rotation "
+              f"correction is disabled.")
+
+    print("Translation tracks:", [t.name for t in loc_tracks])
+    print("Rotation tracks:", [t.name for t in rot_tracks] if rotation_enabled
+          else "(none -- rotation correction disabled, Z rotation stays 0)")
+
+    all_used_tracks = list(loc_tracks)
+    for t in rot_tracks:
+        if t not in all_used_tracks:
+            all_used_tracks.append(t)
 
     # ---- 2b. Diagnostics: catch the #1 cause of "no movement" ----------
     # If a track was only placed (never actually tracked forward/backward
@@ -109,7 +135,7 @@ def main():
     # every frame query below will silently return that same single point
     # -> zero detected motion -> a "stabilized" plane that never moves.
     print("---- Track diagnostics ----")
-    for t in tracks:
+    for t in all_used_tracks:
         frames = [m.frame for m in t.markers]
         if frames:
             print(f"  '{t.name}': {len(frames)} markers, "
@@ -131,7 +157,7 @@ def main():
     # outside the real marker range and silently clamps to the same single
     # marker every time. So we derive the frame range straight from the
     # markers themselves, guaranteeing consistency with find_frame().
-    all_marker_frames = sorted({m.frame for t in tracks for m in t.markers})
+    all_marker_frames = sorted({m.frame for t in all_used_tracks for m in t.markers})
     if not all_marker_frames:
         raise RuntimeError("None of the selected tracks have any markers.")
     derived_start, derived_end = all_marker_frames[0], all_marker_frames[-1]
@@ -243,53 +269,32 @@ def main():
 
     plane_obj.data.materials.append(mat)
 
-    # ---- 6b. Diagnostics: figure out WHY the texture might be pink -----
-    # Pink in Blender almost always means "this file could not be opened",
-    # not "wrong frame of an otherwise valid sequence" (a wrong-frame issue
-    # would normally just hold/repeat a frame, not go pink). So check the
-    # two most likely causes directly: (1) is the path even reachable right
-    # now (e.g. a network/RAID volume that isn't mounted -- the clip itself
-    # may still preview fine if it's using a cached proxy, while a freshly
-    # loaded Image has to hit the real file), and (2) exactly which file
-    # does Blender's own resolver pick for a given frame.
+    # ---- 6b. Diagnostic: confirm the source media is reachable ---------
     import os
     abspath = bpy.path.abspath(clip.filepath)
     print(f"Texture source file exists on disk right now? "
           f"{os.path.exists(abspath)}  ({abspath})")
-
-    test_scene_frames = sorted(set(
-        f + scene_frame_offset for f in
-        (frame_start, frame_start + (frame_end - frame_start) // 2, frame_end)
-    ))
-    orig_current_frame = scene.frame_current
-    print("---- Resolved image-sequence file per test frame ----")
-    for sf in test_scene_frames:
-        scene.frame_set(sf)
-        resolved = img.filepath_from_user(image_user=tex_node.image_user)
-        resolved_abs = bpy.path.abspath(resolved)
-        print(f"  scene frame {sf}: -> {resolved}  "
-              f"(exists={os.path.exists(resolved_abs)})")
-    scene.frame_set(orig_current_frame)
-    print("-------------------------------------------------------")
-    print("If any of the above say exists=False, that file/path is the "
-          "actual problem (not the frame-mapping math): either the volume "
-          "isn't mounted right now, or the frame-number arithmetic is "
-          "landing on a file that genuinely doesn't exist on disk. If "
-          "exists=True for all of them but it's STILL pink in the "
-          "viewport, try toggling Material Preview/Rendered shading or "
-          "check the image's Color Space / 'Missing Files' warnings in "
-          "the Image Editor.")
+    print("If that's False, the volume/mount isn't currently reachable from "
+          "this Blender session (the Clip Editor may still preview fine if "
+          "it's using a cached proxy instead of the raw file). If it's True "
+          "but the texture is still pink in the viewport, try toggling "
+          "Material Preview/Rendered shading.")
 
     # ---- 7. Compute the anchor-frame reference configuration -----------
-    P0 = []
-    for t in tracks:
-        p = marker_local(t, anchor_frame)
-        if p is None:
-            raise RuntimeError(f"Track '{t.name}' has no marker data at "
-                                f"anchor frame {anchor_frame}.")
-        P0.append(p)
-    ca = sum(P0, Vector((0.0, 0.0))) / len(P0)
-    centered0 = [p - ca for p in P0]
+    def anchor_set(track_list, label):
+        pts = []
+        for t in track_list:
+            p = marker_local(t, anchor_frame)
+            if p is None:
+                raise RuntimeError(f"Track '{t.name}' ({label}) has no marker "
+                                    f"data at anchor frame {anchor_frame}.")
+            pts.append(p)
+        centroid = sum(pts, Vector((0.0, 0.0))) / len(pts)
+        return centroid, [p - centroid for p in pts]
+
+    ca, centered0 = anchor_set(loc_tracks, "translation")
+    if rotation_enabled:
+        ca_rot, centered0_rot = anchor_set(rot_tracks, "rotation")
 
     # ---- 8. Per-frame fit + keyframe ------------------------------------
     # Set new keyframes to LINEAR interpolation up front (since we key every
@@ -303,27 +308,41 @@ def main():
 
     observed_locations = []  # for a post-run "did anything actually move" check
 
+    missing_rot_frames = 0
+
     for frame in range(int(frame_start), int(frame_end) + 1):
         Pf = []
         ok = True
-        for t in tracks:
+        for t in loc_tracks:
             p = marker_local(t, frame)
             if p is None:
                 ok = False
                 break
             Pf.append(p)
         if not ok:
-            continue  # skip frames where a tracker has no data
+            continue  # skip frames where a translation tracker has no data
 
         cc = sum(Pf, Vector((0.0, 0.0))) / len(Pf)
-        centeredf = [p - cc for p in Pf]
 
-        if len(tracks) >= 2:
-            num = sum(a.x * c.y - a.y * c.x for a, c in zip(centered0, centeredf))
-            den = sum(a.x * c.x + a.y * c.y for a, c in zip(centered0, centeredf))
-            theta = math.atan2(num, den) * ROTATION_DIRECTION
-        else:
-            theta = 0.0
+        theta = 0.0
+        if rotation_enabled:
+            Pf_rot = []
+            rot_ok = True
+            for t in rot_tracks:
+                p = marker_local(t, frame)
+                if p is None:
+                    rot_ok = False
+                    break
+                Pf_rot.append(p)
+            if rot_ok:
+                cc_rot = sum(Pf_rot, Vector((0.0, 0.0))) / len(Pf_rot)
+                centeredf_rot = [p - cc_rot for p in Pf_rot]
+                num = sum(a.x * c.y - a.y * c.x for a, c in zip(centered0_rot, centeredf_rot))
+                den = sum(a.x * c.x + a.y * c.y for a, c in zip(centered0_rot, centeredf_rot))
+                theta = math.atan2(num, den) * ROTATION_DIRECTION
+            else:
+                missing_rot_frames += 1
+                # keep theta = 0.0 for this frame; translation still applies
 
         cos_t, sin_t = math.cos(theta), math.sin(theta)
         # Rotate cc by -theta
@@ -373,7 +392,12 @@ def main():
 
     print(f"Done. Created '{plane_obj.name}', keyframed scene frames "
           f"{frame_start + scene_frame_offset}-{frame_end + scene_frame_offset} "
-          f"(anchor frame {anchor_frame}, clip-relative).")
+          f"(anchor frame {anchor_frame}, clip-relative). "
+          f"Rotation correction: {'enabled' if rotation_enabled else 'disabled (Z rotation stays 0)'}.")
+    if rotation_enabled and missing_rot_frames:
+        print(f"NOTE: {missing_rot_frames} frame(s) had translation data but "
+              f"no rotation-track data; rotation was left at 0 for those "
+              f"specific frames only.")
 
 
 main()
