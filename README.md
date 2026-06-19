@@ -1,3 +1,4 @@
+
 Stabilize-by-plane script for Blender
 ======================================
 
@@ -39,3 +40,51 @@ How to use
    will appear, fully keyframed.
 5. If the rotation looks mirrored/backwards in your scene, flip
    ROTATION_DIRECTION to -1 and re-run.
+
+__________________________________________________________________
+
+This Blender script is essentially re‑implementing 2D stabilization, but instead of shifting pixels directly, it moves a 3D plane that carries the footage. 
+
+Core Idea
+The footage is placed as a texture on a plane in 3D space.
+
+The plane is keyframed so that its motion cancels out the apparent drift of tracked markers in the image sequence.
+
+This makes the footage appear stabilized when viewed from a fixed camera.
+
+Step‑by‑Step Stabilization Process
+Movie Clip Resolution  
+The script finds the active movie clip and its tracking data. It reads the markers you’ve already placed in Blender’s Stabilization panel.
+
+Track Selection
+
+Translation tracks → used to compute XY drift.
+
+Rotation tracks → used to compute Z‑axis rotation.
+If you don’t assign rotation tracks, only translation correction is applied.
+
+Anchor Frame  
+The script defines a reference frame (anchor). Marker positions at this frame are treated as the “ideal” stationary positions.
+
+Per‑Frame Marker Comparison  
+For each frame:
+
+It finds where the markers currently are.
+
+It compares them to their anchor positions.
+
+From this, it computes the best rigid transform (translation + rotation, no scaling).
+
+Inverse Transform Application  
+Because the shake is baked into the footage, the plane must move in the opposite direction.
+Example: if the markers drift right, the plane shifts left.
+
+Keyframing the Plane  
+The computed inverse transform (X/Y translation + Z rotation) is inserted as keyframes for the plane object.
+This ensures the plane moves frame‑by‑frame to cancel the shake.
+
+Diagnostics  
+The script checks if tracks have enough markers. If a track has only one marker, no motion is detected, and stabilization fails.
+
+Optional Camera  
+A static orthographic camera is added above the plane so you can quickly preview the stabilized footage.
